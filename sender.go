@@ -224,6 +224,7 @@ func New512() hash.Hash {
 	return &state{rate: 72, outputLen: 64, dsbyte: 0x06}
 }
 
+// Вычисление хеша сообщения
 func encode(message string) []byte {
 	messageBytes := []byte(message)
 
@@ -251,7 +252,8 @@ func reader(r io.Reader) {
 }
 
 func main() {
-	c, err := net.Dial("unix", "/tmp/sha3512.sock")
+	// Открываю сокет
+	c, err := net.Dial("unix", "/var/sockets/sha3512.sock")
 	if err != nil {
 		panic(err)
 	}
@@ -261,13 +263,16 @@ func main() {
 	i := 0
 
 	for {
-		println("Отправляю:", "Тестовое сообщение "+strconv.Itoa(i))
+		println("Отправляю:", "Поливода "+strconv.Itoa(i))
 
-		_, err := c.Write(encode("Тестовое сообщение " + strconv.Itoa(i)))
+		// Отправка сообщения и вычисление хеша
+		_, err := c.Write(encode("Поливода " + strconv.Itoa(i)))
 		if err != nil {
 			log.Fatal("write error:", err)
 			break
 		}
+
+		// Чтоб спама не было
 		time.Sleep(1e9)
 
 		i++

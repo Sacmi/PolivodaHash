@@ -221,12 +221,15 @@ func New512() hash.Hash {
 	return &state{rate: 72, outputLen: 64, dsbyte: 0x06}
 }
 
+// байты -> строка
 func decode(bytes []byte) {
 	println("Сообщение:", string(bytes))
 }
 
+// Сводка контрольных сумм и вывод на экран
 func echoServer(c net.Conn) {
 	for {
+		// Вычисление хеша
 		buf := make([]byte, 512)
 		nr, err := c.Read(buf)
 
@@ -248,6 +251,7 @@ func echoServer(c net.Conn) {
 
 		fmt.Println("Хеш: ", sha3bytes)
 
+		// Проверка на совпадание хешей
 		if !bytes.Equal(hashBytes, sha3bytes[:]) {
 			fmt.Println("Хеш не совпадает!")
 		} else {
@@ -257,18 +261,21 @@ func echoServer(c net.Conn) {
 }
 
 func main() {
-	listener, err := net.Listen("unix", "/tmp/sha3512.sock")
+	// Открываю сокет
+	listener, err := net.Listen("unix", "/var/sockets/sha3512.sock")
 	if err != nil {
 		println("Не получилось создать сокет")
 		return
 	}
 
 	for {
+		// Получаю сообщение
 		fd, err := listener.Accept()
 		if err != nil {
 			return
 		}
 
+		// Обработка сообщения
 		echoServer(fd)
 	}
 }
