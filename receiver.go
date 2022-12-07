@@ -241,7 +241,7 @@ func (d *digest) constSum() [Size]byte {
 
 // байты -> строка
 func decode(bytes []byte) {
-	println("Message: ", string(bytes))
+	println("Received: ", string(bytes))
 }
 
 func Sum(data []byte) [Size]byte {
