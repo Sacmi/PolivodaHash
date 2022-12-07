@@ -2,232 +2,257 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"golang.org/x/crypto/sha3"
 	"hash"
 	"net"
-	"sha3-512/keccak"
-	"unsafe"
 )
 
-func xorInUnaligned(d *state, buf []byte) {
-	n := len(buf)
-	bw := (*[maxRate / 8]uint64)(unsafe.Pointer(&buf[0]))[: n/8 : n/8]
-	if n >= 72 {
-		d.a[0] ^= bw[0]
-		d.a[1] ^= bw[1]
-		d.a[2] ^= bw[2]
-		d.a[3] ^= bw[3]
-		d.a[4] ^= bw[4]
-		d.a[5] ^= bw[5]
-		d.a[6] ^= bw[6]
-		d.a[7] ^= bw[7]
-		d.a[8] ^= bw[8]
-	}
-	if n >= 104 {
-		d.a[9] ^= bw[9]
-		d.a[10] ^= bw[10]
-		d.a[11] ^= bw[11]
-		d.a[12] ^= bw[12]
-	}
-	if n >= 136 {
-		d.a[13] ^= bw[13]
-		d.a[14] ^= bw[14]
-		d.a[15] ^= bw[15]
-		d.a[16] ^= bw[16]
-	}
-	if n >= 144 {
-		d.a[17] ^= bw[17]
-	}
-	if n >= 168 {
-		d.a[18] ^= bw[18]
-		d.a[19] ^= bw[19]
-		d.a[20] ^= bw[20]
-	}
-}
+const Size = 20
 
-func copyOutUnaligned(d *state, buf []byte) {
-	ab := (*[maxRate]uint8)(unsafe.Pointer(&d.a[0]))
-	copy(buf, ab[:])
-}
-
-var (
-	xorIn   = xorInUnaligned
-	copyOut = copyOutUnaligned
-)
+// The blocksize of SHA-1 in bytes.
+const BlockSize = 64
 
 const (
-	spongeAbsorbing int = iota
-	spongeSqueezing
-	maxRate = 168
+	chunk = 64
+	init0 = 0x67452301
+	init1 = 0xEFCDAB89
+	init2 = 0x98BADCFE
+	init3 = 0x10325476
+	init4 = 0xC3D2E1F0
 )
 
-type storageBuf [maxRate / 8]uint64
-
-type state struct {
-	a      [25]uint64
-	buf    []byte
-	rate   int
-	dsbyte byte
-
-	storage storageBuf
-
-	outputLen int
-	state     int
+// digest represents the partial evaluation of a checksum.
+type digest struct {
+	h   [5]uint32
+	x   [chunk]byte
+	nx  int
+	len uint64
 }
 
-func (b *storageBuf) asBytes() *[maxRate]byte {
-	return (*[maxRate]byte)(unsafe.Pointer(b))
+const (
+	magic         = "sha\x01"
+	marshaledSize = len(magic) + 5*4 + chunk + 8
+)
+
+func (d *digest) MarshalBinary() ([]byte, error) {
+	b := make([]byte, 0, marshaledSize)
+	b = append(b, magic...)
+	b = appendUint32(b, d.h[0])
+	b = appendUint32(b, d.h[1])
+	b = appendUint32(b, d.h[2])
+	b = appendUint32(b, d.h[3])
+	b = appendUint32(b, d.h[4])
+	b = append(b, d.x[:d.nx]...)
+	b = b[:len(b)+len(d.x)-int(d.nx)] // already zero
+	b = appendUint64(b, d.len)
+	return b, nil
 }
 
-func (d *state) BlockSize() int { return d.rate }
-
-func (d *state) Size() int { return d.outputLen }
-
-func (d *state) Reset() {
-	// Zero the permutation's state.
-	for i := range d.a {
-		d.a[i] = 0
+func (d *digest) UnmarshalBinary(b []byte) error {
+	if len(b) < len(magic) || string(b[:len(magic)]) != magic {
+		return errors.New("crypto/sha1: invalid hash state identifier")
 	}
-	d.state = spongeAbsorbing
-	d.buf = d.storage.asBytes()[:0]
+	if len(b) != marshaledSize {
+		return errors.New("crypto/sha1: invalid hash state size")
+	}
+	b = b[len(magic):]
+	b, d.h[0] = consumeUint32(b)
+	b, d.h[1] = consumeUint32(b)
+	b, d.h[2] = consumeUint32(b)
+	b, d.h[3] = consumeUint32(b)
+	b, d.h[4] = consumeUint32(b)
+	b = b[copy(d.x[:], b):]
+	b, d.len = consumeUint64(b)
+	d.nx = int(d.len % chunk)
+	return nil
 }
 
-func (d *state) clone() *state {
-	ret := *d
-	if ret.state == spongeAbsorbing {
-		ret.buf = ret.storage.asBytes()[:len(ret.buf)]
+func appendUint64(b []byte, x uint64) []byte {
+	var a [8]byte
+	binary.BigEndian.PutUint64(a[:], x)
+	return append(b, a[:]...)
+}
+
+func appendUint32(b []byte, x uint32) []byte {
+	var a [4]byte
+	binary.BigEndian.PutUint32(a[:], x)
+	return append(b, a[:]...)
+}
+
+func consumeUint64(b []byte) ([]byte, uint64) {
+	_ = b[7]
+	x := uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 |
+		uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0])<<56
+	return b[8:], x
+}
+
+func consumeUint32(b []byte) ([]byte, uint32) {
+	_ = b[3]
+	x := uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
+	return b[4:], x
+}
+
+func (d *digest) Reset() {
+	d.h[0] = init0
+	d.h[1] = init1
+	d.h[2] = init2
+	d.h[3] = init3
+	d.h[4] = init4
+	d.nx = 0
+	d.len = 0
+}
+
+// New returns a new hash.Hash computing the SHA1 checksum. The Hash also
+// implements encoding.BinaryMarshaler and encoding.BinaryUnmarshaler to
+// marshal and unmarshal the internal state of the hash.
+func New() hash.Hash {
+	d := new(digest)
+	d.Reset()
+	return d
+}
+
+func (d *digest) Size() int { return Size }
+
+func (d *digest) BlockSize() int { return BlockSize }
+
+func (d *digest) Write(p []byte) (nn int, err error) {
+	nn = len(p)
+	d.len += uint64(nn)
+	if d.nx > 0 {
+		n := copy(d.x[d.nx:], p)
+		d.nx += n
+		if d.nx == chunk {
+			d.nx = 0
+		}
+		p = p[n:]
+	}
+	if len(p) >= chunk {
+		n := len(p) &^ (chunk - 1)
+		p = p[n:]
+	}
+	if len(p) > 0 {
+		d.nx = copy(d.x[:], p)
+	}
+	return
+}
+
+func (d *digest) Sum(in []byte) []byte {
+	// Make a copy of d so that caller can keep writing and summing.
+	d0 := *d
+	hash := d0.checkSum()
+	return append(in, hash[:]...)
+}
+
+func (d *digest) checkSum() [Size]byte {
+	len := d.len
+	// Padding.  Add a 1 bit and 0 bits until 56 bytes mod 64.
+	var tmp [64]byte
+	tmp[0] = 0x80
+	if len%64 < 56 {
+		d.Write(tmp[0 : 56-len%64])
 	} else {
-		ret.buf = ret.storage.asBytes()[d.rate-cap(d.buf) : d.rate]
+		d.Write(tmp[0 : 64+56-len%64])
 	}
 
-	return &ret
+	// Length in bits.
+	len <<= 3
+	binary.BigEndian.PutUint64(tmp[:], len)
+	d.Write(tmp[0:8])
+
+	if d.nx != 0 {
+		panic("d.nx != 0")
+	}
+
+	var digest [Size]byte
+
+	binary.BigEndian.PutUint32(digest[0:], d.h[0])
+	binary.BigEndian.PutUint32(digest[4:], d.h[1])
+	binary.BigEndian.PutUint32(digest[8:], d.h[2])
+	binary.BigEndian.PutUint32(digest[12:], d.h[3])
+	binary.BigEndian.PutUint32(digest[16:], d.h[4])
+
+	return digest
 }
 
-// permute applies the KeccakF-1600 permutation. It handles
-// any input-output buffering.
-func (d *state) permute() {
-	switch d.state {
-	case spongeAbsorbing:
-		// If we're absorbing, we need to xor the input into the state
-		// before applying the permutation.
-		xorIn(d, d.buf)
-		d.buf = d.storage.asBytes()[:0]
-		keccak.KeccakF1600(&d.a)
-	case spongeSqueezing:
-		// If we're squeezing, we need to apply the permutation before
-		// copying more output.
-		keccak.KeccakF1600(&d.a)
-		d.buf = d.storage.asBytes()[:d.rate]
-		copyOut(d, d.buf)
-	}
+// ConstantTimeSum computes the same result of Sum() but in constant time
+func (d *digest) ConstantTimeSum(in []byte) []byte {
+	d0 := *d
+	hash := d0.constSum()
+	return append(in, hash[:]...)
 }
 
-// pads appends the domain separation bits in dsbyte, applies
-// the multi-bitrate 10..1 padding rule, and permutes the state.
-func (d *state) padAndPermute(dsbyte byte) {
-	if d.buf == nil {
-		d.buf = d.storage.asBytes()[:0]
+func (d *digest) constSum() [Size]byte {
+	var length [8]byte
+	l := d.len << 3
+	for i := uint(0); i < 8; i++ {
+		length[i] = byte(l >> (56 - 8*i))
 	}
-	// Pad with this instance's domain-separator bits. We know that there's
-	// at least one byte of space in d.buf because, if it were full,
-	// permute would have been called to empty it. dsbyte also contains the
-	// first one bit for the padding. See the comment in the state struct.
-	d.buf = append(d.buf, dsbyte)
-	zerosStart := len(d.buf)
-	d.buf = d.storage.asBytes()[:d.rate]
-	for i := zerosStart; i < d.rate; i++ {
-		d.buf[i] = 0
-	}
-	// This adds the final one bit for the padding. Because of the way that
-	// bits are numbered from the LSB upwards, the final bit is the MSB of
-	// the last byte.
-	d.buf[d.rate-1] ^= 0x80
-	// Apply the permutation
-	d.permute()
-	d.state = spongeSqueezing
-	d.buf = d.storage.asBytes()[:d.rate]
-	copyOut(d, d.buf)
-}
 
-func (d *state) Write(p []byte) (written int, err error) {
-	if d.state != spongeAbsorbing {
-		panic("sha3: write to sponge after read")
-	}
-	if d.buf == nil {
-		d.buf = d.storage.asBytes()[:0]
-	}
-	written = len(p)
+	nx := byte(d.nx)
+	t := nx - 56                 // if nx < 56 then the MSB of t is one
+	mask1b := byte(int8(t) >> 7) // mask1b is 0xFF iff one block is enough
 
-	for len(p) > 0 {
-		if len(d.buf) == 0 && len(p) >= d.rate {
-			// The fast path; absorb a full "rate" bytes of input and apply the permutation.
-			xorIn(d, p[:d.rate])
-			p = p[d.rate:]
-			keccak.KeccakF1600(&d.a)
+	separator := byte(0x80) // gets reset to 0x00 once used
+	for i := byte(0); i < chunk; i++ {
+		mask := byte(int8(i-nx) >> 7) // 0x00 after the end of data
+
+		// if we reached the end of the data, replace with 0x80 or 0x00
+		d.x[i] = (^mask & separator) | (mask & d.x[i])
+
+		// zero the separator once used
+		separator &= mask
+
+		if i >= 56 {
+			// we might have to write the length here if all fit in one block
+			d.x[i] |= mask1b & length[i-56]
+		}
+	}
+
+	var digest [Size]byte
+	for i, s := range d.h {
+		digest[i*4] = mask1b & byte(s>>24)
+		digest[i*4+1] = mask1b & byte(s>>16)
+		digest[i*4+2] = mask1b & byte(s>>8)
+		digest[i*4+3] = mask1b & byte(s)
+	}
+
+	for i := byte(0); i < chunk; i++ {
+		// second block, it's always past the end of data, might start with 0x80
+		if i < 56 {
+			d.x[i] = separator
+			separator = 0
 		} else {
-			// The slow path; buffer the input until we can fill the sponge, and then xor it in.
-			todo := d.rate - len(d.buf)
-			if todo > len(p) {
-				todo = len(p)
-			}
-			d.buf = append(d.buf, p[:todo]...)
-			p = p[todo:]
-
-			// If the sponge is full, apply the permutation.
-			if len(d.buf) == d.rate {
-				d.permute()
-			}
+			d.x[i] = length[i-56]
 		}
 	}
 
-	return
-}
-
-// Read squeezes an arbitrary number of bytes from the sponge.
-func (d *state) Read(out []byte) (n int, err error) {
-	// If we're still absorbing, pad and apply the permutation.
-	if d.state == spongeAbsorbing {
-		d.padAndPermute(d.dsbyte)
+	for i, s := range d.h {
+		digest[i*4] |= ^mask1b & byte(s>>24)
+		digest[i*4+1] |= ^mask1b & byte(s>>16)
+		digest[i*4+2] |= ^mask1b & byte(s>>8)
+		digest[i*4+3] |= ^mask1b & byte(s)
 	}
 
-	n = len(out)
-
-	// Now, do the squeezing.
-	for len(out) > 0 {
-		n := copy(out, d.buf)
-		d.buf = d.buf[n:]
-		out = out[n:]
-
-		// Apply the permutation if we've squeezed the sponge dry.
-		if len(d.buf) == 0 {
-			d.permute()
-		}
-	}
-
-	return
-}
-
-func (d *state) Sum(in []byte) []byte {
-	// Make a copy of the original hash so that caller can keep writing
-	// and summing.
-	dup := d.clone()
-	hash := make([]byte, dup.outputLen)
-	dup.Read(hash)
-	return append(in, hash...)
-}
-
-func New512() hash.Hash {
-	return &state{rate: 72, outputLen: 64, dsbyte: 0x06}
+	return digest
 }
 
 // байты -> строка
 func decode(bytes []byte) {
-	println("Сообщение:", string(bytes))
+	println("Message: ", string(bytes))
+}
+
+func Sum(data []byte) [Size]byte {
+	var d digest
+	d.Reset()
+	d.Write(data)
+	return d.checkSum()
 }
 
 // Сводка контрольных сумм и вывод на экран
-func echoServer(c net.Conn) {
+func checkForHash(c net.Conn) {
 	for {
 		// Вычисление хеша
 		buf := make([]byte, 512)
@@ -239,21 +264,16 @@ func echoServer(c net.Conn) {
 
 		data := buf[0:nr]
 
-		hashBytes := data[0:64]
-		data = data[64:nr]
+		hashBytes := data[0:Size]
+		data = data[Size:nr]
 
-		h := New512()
-		h.Write(data)
-		digest := h.Sum(data)
-		sha3bytes := sha3.Sum512(data)
+		sha1bytes := sha1.Sum(data)
 
-		_ = digest
-
-		fmt.Println("Хеш: ", sha3bytes)
+		fmt.Println("Hash: ", sha1bytes)
 
 		// Проверка на совпадание хешей
-		if !bytes.Equal(hashBytes, sha3bytes[:]) {
-			fmt.Println("Хеш не совпадает!")
+		if !bytes.Equal(hashBytes, sha1bytes[:]) {
+			fmt.Println("Invalid hash")
 		} else {
 			decode(data)
 		}
@@ -262,9 +282,9 @@ func echoServer(c net.Conn) {
 
 func main() {
 	// Открываю сокет
-	listener, err := net.Listen("unix", "/var/sockets/sha3512.sock")
+	listener, err := net.Listen("unix", "/tmp/sha1.sock")
 	if err != nil {
-		println("Не получилось создать сокет")
+		println("Error socket")
 		return
 	}
 
@@ -276,6 +296,6 @@ func main() {
 		}
 
 		// Обработка сообщения
-		echoServer(fd)
+		checkForHash(fd)
 	}
 }
